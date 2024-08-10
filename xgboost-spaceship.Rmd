@@ -1,0 +1,212 @@
+---
+title: "Spaceship Titanic - XGBoost"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(caret)
+library(mice)
+```
+
+```{r}
+train <- read.csv("train.csv")
+test <- read.csv("test.csv")
+```
+
+Checking NA values 
+```{r}
+test$Transported <- NA
+train$isTrain <- TRUE
+test$isTrain <- FALSE
+df <- rbind(train, test)
+df
+```
+```{r}
+check.na <- function(df) apply(df, 2, function(x) sum(is.na(x)))
+```
+
+```{r}
+check.na(df)
+```
+
+Add a Solo variable with PassengerId
+```{r}
+df$Group <- sapply(df$PassengerId, function(x) {
+  str_split(x, "_")[[1]][1]
+})
+solo <- data.frame(
+  df %>%
+  group_by(Group) %>%
+  summarize(n = n())
+)
+df <- merge(df, solo) %>%
+  mutate(Solo = ifelse(n == 1, "True", "False"))
+df
+```
+
+
+```{r}
+check.na(df)
+```
+
+Visualize Service variables distribution
+```{r}
+ggplot(df %>% pivot_longer(cols = cols, names_to = "Service", values_to = "Value")) +
+  geom_histogram(aes(Value)) +
+  facet_wrap(~ Service, scales = "free")
+```
+
+```{r}
+# cols <- c("RoomService", "FoodCourt", "ShoppingMall", "Spa", "VRDeck")
+# df <- df %>%
+#   mutate_at(cols, log1p)
+# df
+```
+```{r}
+# ggplot(df %>% pivot_longer(cols = cols, names_to = "Service", values_to = "Value")) +
+#   geom_histogram(aes(Value)) +
+#   facet_wrap(~ Service, scales = "free")
+```
+
+Clean Cabin
+```{r}
+Cabin_sep <- data.frame(Cabin = df$Cabin) %>% 
+  separate(col = Cabin, into = c("Deck", "Num", "Side"), sep = "/")
+
+df <- df %>%
+  mutate(Deck = Cabin_sep$Deck,
+         Num = Cabin_sep$Num,
+         Side = Cabin_sep$Side) %>%
+  select(-Cabin)
+df
+```
+
+```{r}
+check.na(df)
+```
+
+```{r}
+df <- df %>%
+  mutate(Num = replace_na(Num, median(Num, na.rm = TRUE)),
+         Side = replace_na(Side, "P"))
+check.na(df)
+```
+
+Imputation using mice
+```{r}
+imp <- mice(df, m = 1, method = c("norm"))
+imp_df <- complete(imp)
+check.na(imp_df)
+```
+```{r}
+imp_df <- imp_df %>%
+  mutate_if(is.character, as.factor)
+str(df)
+```
+
+
+Separate the data set
+```{r}
+modelling <- imp_df[imp_df$isTrain == TRUE, ]
+submitting <- imp_df[imp_df$isTrain == FALSE, ]
+modelling
+```
+
+
+Train test split
+```{r}
+modelling <- modelling %>%
+  select(-Group, -PassengerId, -n, -isTrain, -Name) %>%
+  mutate(Transported = ifelse(Transported == "True", 1, 0)) %>%
+  mutate_if(is.factor, is.numeric)
+```
+
+```{r}
+test_ind <- createDataPartition(modelling$Transported, times = 1, p = 0.2, list = FALSE)
+train <- modelling[-test_ind, ]
+test <- modelling[test_ind, ]
+```
+
+```{r}
+library(xgboost)
+```
+
+```{r}
+xg <- xgboost(data = as.matrix(train %>% 
+                                 select(-Transported)), 
+              label = train$Transported,
+              nrounds = 5,
+              objective = "binary:logistic")
+```
+```{r}
+pred <- predict(xg, as.matrix(test %>% 
+                        select(-Transported)))
+class(test$Transported)
+confusionMatrix(as.factor(ifelse(pred > 0.5, 1, 0)), as.factor(test$Transported))
+
+```
+```{r}
+input <- as.matrix(submitting %>%
+                     select(-Group, -n, -Name, -isTrain, -PassengerId, -Transported) %>%
+                     mutate_if(is.factor, as.numeric))
+```
+
+```{r}
+output <- predict(xg, input)
+
+submission <- data.frame(
+  PassengerId = submitting$PassengerId,
+  Transported = ifelse(output > 0.5, "True", "False")
+)
+
+write.csv(submission, "submission_3.csv", row.names = FALSE)
+```
+
+```{r}
+modelLookup("xgbTree")
+```
+
+```{r}
+trControl <- trainControl(method = "cv", number = 5, verboseIter = FALSE, allowParallel = TRUE)
+grid_default <- expand.grid(
+  nrounds = seq(20,50,10),
+  max_depth = 7, # seq(6, 10, 1),
+  eta = 0.2, # seq(0.2, 0.5, 0.1),
+  gamma = seq(0, 0.05, 0.01),
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 0.7
+)
+xg_2 <- train(as.matrix(train %>% select(-Transported)), as.factor(train$Transported),
+              method = "xgbTree", trControl = trControl, tuneGrid = grid_default,
+              verbose = FALSE)
+
+xg_2$bestTune
+pred2 <- predict(xg_2, as.matrix(select(test, -Transported)))
+confusionMatrix(pred2, as.factor(test$Transported))
+```
+```{r}
+xg_3 <- xgboost(as.matrix(select(train, -Transported)), train$Transported,
+                params = list(max_depth = 7, 
+                           eta = 0.3, 
+                           gamma = 0.04, 
+                           subsample = 0.7),
+                nrounds = 20,
+                objective = "binary:logistic")
+```
+```{r}
+pred3 <- predict(xg_3, as.matrix(select(test, -Transported)))
+confusionMatrix(as.factor(ifelse(pred3 > 0.5, 1, 0)), as.factor(test$Transported))
+```
+```{r}
+output3 <- predict(xg_3, input)
+
+submission3 <- data.frame(
+  PassengerId = submitting$PassengerId,
+  Transported = ifelse(output3 > 0.5, "True", "False")
+)
+
+write.csv(submission3, "submission_4.csv", row.names = FALSE)
+```
+
